@@ -39,8 +39,11 @@
 <body class="bg-gray-900 text-white min-h-screen flex flex-col items-center font-sans">
 
     <!-- Header -->
-    <header class="w-full border-b border-gray-700 p-4 text-center mb-4">
+    <header class="w-full border-b border-gray-700 p-4 text-center mb-4 relative">
         <h1 class="text-3xl font-bold tracking-wider">WORDLE <span class="text-xs font-normal text-gray-400">BY NAVIN</span></h1>
+        <a href="?" id="home-link" class="hidden absolute left-4 top-1/2 transform -translate-y-1/2 text-gray-500 hover:text-white text-sm uppercase border border-gray-600 px-3 py-1 rounded">
+            New Game
+        </a>
     </header>
 
     <!-- LOADING SCREEN (Shown while fetching words.txt) -->
@@ -73,9 +76,15 @@
             <p id="error-target" class="text-red-400 text-xs mt-1 hidden">Word must be 5 letters and in the dictionary.</p>
         </div>
 
-        <button id="btn-start" class="w-full bg-green-600 hover:bg-green-700 text-white font-bold py-3 px-4 rounded transition-colors">
-            Start Game
-        </button>
+        <div class="flex gap-3">
+            <button id="btn-start" class="flex-1 bg-green-600 hover:bg-green-700 text-white font-bold py-3 px-4 rounded transition-colors">
+                Play Local
+            </button>
+            <button id="btn-share" class="flex-1 bg-blue-600 hover:bg-blue-700 text-white font-bold py-3 px-4 rounded transition-colors">
+                Copy Link
+            </button>
+        </div>
+        <p class="text-xs text-gray-500 mt-4 text-center">Use "Copy Link" to send this word to a friend.</p>
     </div>
 
     <!-- GAME SCREEN -->
@@ -100,8 +109,8 @@
         <div class="bg-gray-800 p-8 rounded-lg shadow-2xl text-center max-w-sm mx-4 transform transition-all scale-100">
             <h2 id="modal-title" class="text-2xl font-bold mb-2"></h2>
             <div id="modal-content" class="text-gray-300 mb-6"></div>
-            <button onclick="location.reload()" class="bg-green-600 hover:bg-green-700 text-white font-bold py-2 px-6 rounded uppercase tracking-wide">
-                Play Again
+            <button onclick="location.href = window.location.pathname" class="bg-green-600 hover:bg-green-700 text-white font-bold py-2 px-6 rounded uppercase tracking-wide">
+                New Game
             </button>
         </div>
     </div>
@@ -116,6 +125,7 @@ let MAX_GUESSES = 6;
 let currentGuess = "";
 let guesses = []; // Array of strings
 let isGameOver = false;
+let isAnimating = false;
 
 // UI Elements
 const loadingScreen = document.getElementById('loading-screen');
@@ -125,13 +135,90 @@ const gridContainer = document.getElementById('grid-container');
 const keyboardContainer = document.getElementById('keyboard-container');
 const toastContainer = document.getElementById('toast-container');
 const modalOverlay = document.getElementById('modal-overlay');
+const homeLink = document.getElementById('home-link');
+
+/**
+ * UTILITY: AES-GCM Encryption for Robust URL Security
+ */
+
+// Generate a cryptographic key from a hardcoded phrase (prevents casual decoding)
+async function getCryptoKey() {
+    const enc = new TextEncoder();
+    // SHA-256 hash of the secret ensures we have a valid 256-bit key for AES
+    const keyData = await window.crypto.subtle.digest('SHA-256', enc.encode("W0₹DleByN@v!NSeC₹eT$@Lt"));
+    return window.crypto.subtle.importKey(
+        "raw",
+        keyData,
+        "AES-GCM",
+        false,
+        ["encrypt", "decrypt"]
+    );
+}
+
+async function encryptData(word, maxGuesses) {
+    try {
+        const key = await getCryptoKey();
+        const iv = window.crypto.getRandomValues(new Uint8Array(12)); // Random initialization vector
+        const data = JSON.stringify({ w: word, g: maxGuesses });
+        const enc = new TextEncoder();
+        
+        const ciphertext = await window.crypto.subtle.encrypt(
+            { name: "AES-GCM", iv: iv },
+            key,
+            enc.encode(data)
+        );
+
+        // Combine IV + Ciphertext
+        const combined = new Uint8Array(iv.byteLength + ciphertext.byteLength);
+        combined.set(iv);
+        combined.set(new Uint8Array(ciphertext), iv.byteLength);
+
+        // Convert to Base64URL-safe string for the URL
+        return btoa(String.fromCharCode(...combined))
+            .replace(/\+/g, '-')
+            .replace(/\//g, '_')
+            .replace(/=+$/, '');
+    } catch (e) {
+        console.error("Encryption failed", e);
+        return null;
+    }
+}
+
+async function decryptData(encryptedStr) {
+    try {
+        // Restore Base64 standard characters from URL-safe format
+        let b64 = encryptedStr.replace(/-/g, '+').replace(/_/g, '/');
+        while (b64.length % 4) b64 += '=';
+        
+        const combinedStr = atob(b64);
+        const combined = new Uint8Array(combinedStr.length);
+        for(let i=0; i<combinedStr.length; i++) combined[i] = combinedStr.charCodeAt(i);
+
+        // Extract IV (first 12 bytes) and Ciphertext
+        const iv = combined.slice(0, 12);
+        const ciphertext = combined.slice(12);
+        const key = await getCryptoKey();
+
+        const decrypted = await window.crypto.subtle.decrypt(
+            { name: "AES-GCM", iv: iv },
+            key,
+            ciphertext
+        );
+
+        const dec = new TextDecoder();
+        return JSON.parse(dec.decode(decrypted));
+    } catch (e) {
+        console.error("Decryption failed", e);
+        return null;
+    }
+}
 
 /**
  * INITIALIZATION: Load words from file
  */
 window.addEventListener('DOMContentLoaded', async () => {
     try {
-        // Fetch the file locally. This requires a local server (Live Server or python -m http.server)
+        // Fetch the file locally. This requires a local server.
         const response = await fetch('words.txt');
 
         if (!response.ok) {
@@ -152,8 +239,34 @@ window.addEventListener('DOMContentLoaded', async () => {
             throw new Error("words.txt is empty or contains no 5-letter words.");
         }
 
-        // Hide loader, show setup
+        // Hide loader
         loadingScreen.classList.add('hidden');
+
+        // CHECK URL PARAMS FOR VIRTUAL PLAY
+        const urlParams = new URLSearchParams(window.location.search);
+        const gameData = urlParams.get('data');
+
+        if (gameData) {
+            // Decryption is now Async
+            const decoded = await decryptData(gameData);
+            
+            if (decoded && decoded.w && decoded.g) {
+                // Validate decrypted word against dictionary
+                if (VALID_WORDS.has(decoded.w)) {
+                    TARGET_WORD = decoded.w;
+                    MAX_GUESSES = parseInt(decoded.g) || 6;
+                    homeLink.classList.remove('hidden'); // Show "New Game" link
+                    startGame();
+                    return;
+                } else {
+                    showToast("Invalid word in link");
+                }
+            } else {
+                showToast("Invalid or corrupted game link");
+            }
+        }
+
+        // If no params or invalid params, show setup
         setupScreen.classList.remove('hidden');
 
     } catch (error) {
@@ -175,6 +288,7 @@ window.addEventListener('DOMContentLoaded', async () => {
 const inputGuesses = document.getElementById('input-max-guesses');
 const inputTarget = document.getElementById('input-target-word');
 const btnStart = document.getElementById('btn-start');
+const btnShare = document.getElementById('btn-share');
 const errorGuesses = document.getElementById('error-guesses');
 const errorTarget = document.getElementById('error-target');
 const btnToggle = document.getElementById('toggle-visibility');
@@ -185,8 +299,10 @@ btnToggle.addEventListener('click', () => {
     btnToggle.innerText = type === 'password' ? 'SHOW' : 'HIDE';
 });
 
-btnStart.addEventListener('click', () => {
+function validateInputs() {
     let valid = true;
+    let word = "";
+    let guesses = 6;
 
     // Validate Max Guesses
     const gVal = parseInt(inputGuesses.value);
@@ -195,7 +311,7 @@ btnStart.addEventListener('click', () => {
         valid = false;
     } else {
         errorGuesses.classList.add('hidden');
-        MAX_GUESSES = gVal;
+        guesses = gVal;
     }
 
     // Validate Target Word
@@ -205,11 +321,37 @@ btnStart.addEventListener('click', () => {
         valid = false;
     } else {
         errorTarget.classList.add('hidden');
-        TARGET_WORD = tVal;
+        word = tVal;
     }
 
-    if (valid) {
+    return valid ? { word, guesses } : null;
+}
+
+btnStart.addEventListener('click', () => {
+    const data = validateInputs();
+    if (data) {
+        TARGET_WORD = data.word;
+        MAX_GUESSES = data.guesses;
         startGame();
+    }
+});
+
+btnShare.addEventListener('click', async () => {
+    const data = validateInputs();
+    if (data) {
+        // Encryption is now Async
+        const encrypted = await encryptData(data.word, data.guesses);
+        if (encrypted) {
+            const url = `${window.location.origin}${window.location.pathname}?data=${encrypted}`;
+            
+            navigator.clipboard.writeText(url).then(() => {
+                showToast("Secure Link Copied!");
+            }).catch(err => {
+                showToast("Failed to copy link");
+            });
+        } else {
+            showToast("Encryption Failed");
+        }
     }
 });
 
@@ -287,7 +429,7 @@ function handleKeydown(e) {
 }
 
 function handleInput(key) {
-    if (isGameOver) return;
+    if (isGameOver || isAnimating) return;
 
     if (key === 'Backspace') {
         if (currentGuess.length > 0) {
@@ -319,7 +461,7 @@ function handleInput(key) {
         const currentRow = guesses.length;
         const boxIdx = currentRow * 5 + (currentGuess.length - 1);
         const box = document.getElementById(`box-${boxIdx}`);
-
+        
         box.classList.remove('animate-pop');
         void box.offsetWidth; // trigger reflow
         box.classList.add('animate-pop');
@@ -350,6 +492,7 @@ function updateGrid() {
 }
 
 function submitGuess() {
+    isAnimating = true;
     const rowStart = guesses.length * 5;
     const guessArr = currentGuess.split('');
     const targetArr = TARGET_WORD.split('');
@@ -381,7 +524,7 @@ function submitGuess() {
     guessArr.forEach((char, i) => {
         const box = document.getElementById(`box-${rowStart + i}`);
         const delayClass = `delay-${i * 100}`;
-
+        
         // Wait for flip midpoint to change color
         setTimeout(() => {
             box.classList.remove('border-gray-400', 'border-gray-600', 'bg-transparent');
@@ -404,6 +547,7 @@ function submitGuess() {
             isGameOver = true;
         }
         currentGuess = "";
+        isAnimating = false;
     }, 1500);
 }
 
